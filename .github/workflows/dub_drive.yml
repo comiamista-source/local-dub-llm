@@ -162,9 +162,10 @@ jobs:
                 sleep 30
               fi
             done
-            # Final rebuild from the chunk folder to produce the mux (with gaps
-            # where any chunks are still missing after 5 passes).
-            python dub_video.py "$WORKDIR/chunks" $COMMON || true
+            # NOTE: the loop's last pass already produced the muxed video
+            # (each pass ends with "DONE. Saved"), so we do NOT run another
+            # dub_video.py here - that would trigger an extra (wasteful) dub
+            # attempt on the missing chunk before uploading.
 
             # Collect chunks that still failed (part_NNN with no dub_NNN) so they
             # ship to DubDone next to the video. You re-dub just these next run.

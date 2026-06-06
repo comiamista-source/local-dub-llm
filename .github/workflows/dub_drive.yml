@@ -1,0 +1,221 @@
+name: Dub from Drive (auto-pickup)
+
+# You drop a video into your Google Drive "DubInbox" folder, then press Run.
+# This grabs the newest unprocessed video, dubs it (Hindi -> English, clean
+# normal mode, watermark-free), writes the result to "DubDone", and moves the
+# original into "DubInbox/archive" so it is never dubbed twice.
+# Chunks are ~60s by default: whole sentences per piece (no choppy 10s cuts),
+# and all pieces still dub in parallel so it stays fast.
+#
+# Requires one secret: RCLONE_CONF  (your rclone Google Drive config text).
+# Optional secrets: DUB_BASE_URL, YT_COOKIES_B64 (not needed for this flow).
+
+on:
+  workflow_dispatch:
+    inputs:
+      src:
+        description: "Source language"
+        default: "Hindi"
+        required: true
+      target:
+        description: "Target language"
+        default: "English"
+        required: true
+      genre:
+        description: "Genre (monologue, podcast, ott_movie_sequence, advertisement, edtech, academic_lecture_formal)"
+        default: "monologue"
+        required: true
+      speakers:
+        description: "Number of speakers"
+        default: "1"
+        required: true
+      chunk:
+        description: "Seconds per chunk. 60 = clean + a bit fast (default). Bigger = cleaner/slower, smaller = faster/choppier."
+        default: "60"
+        required: false
+      workers:
+        description: "Max chunks dubbing at once. 8 = reliable for long videos (no overload). Higher = faster but risks failures."
+        default: "8"
+        required: false
+      tries:
+        description: "Retries per chunk before giving up. After this, the video ships with gaps + failed chunks saved for a manual re-run."
+        default: "5"
+        required: false
+      inbox:
+        description: "Drive inbox folder name"
+        default: "DubInbox2"
+        required: true
+      outbox:
+        description: "Drive output folder name"
+        default: "DubDone"
+        required: true
+
+jobs:
+  dub:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ffmpeg + rclone + helpers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python -m pip install --upgrade pip
+          pip install requests
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+
+      - name: Connect Google Drive
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          if [ -z "$RCLONE_CONF" ]; then
+            echo "::error::RCLONE_CONF secret is not set. Add it (rclone Drive config) before running."
+            exit 1
+          fi
+          mkdir -p ~/.config/rclone
+          printf '%s' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
+          echo "rclone configured."
+
+      - name: Pull newest video from Drive inbox
+        id: pull
+        env:
+          INBOX: ${{ github.event.inputs.inbox }}
+        run: |
+          mkdir -p input output
+          REMOTE="gdrive:${INBOX}"
+          echo "Scanning $REMOTE for videos (newest first)..."
+          # List files, pick the newest video via helper script (parse-safe).
+          NEWEST=$(rclone lsjson "$REMOTE" --files-only 2>/dev/null | python3 pick_newest.py)
+          if [ -z "$NEWEST" ]; then
+            echo "::warning::No video found in $REMOTE. Drop a file there and run again."
+            echo "found=no" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Newest video: $NEWEST"
+          rclone copy "$REMOTE/$NEWEST" input/ -v --drive-chunk-size 64M
+          echo "found=yes" >> "$GITHUB_OUTPUT"
+          # Save the exact name for later steps (archive + output naming).
+          printf '%s' "$NEWEST" > .picked_name
+          echo "name<<EOF" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$NEWEST" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Dub the video
+        if: steps.pull.outputs.found == 'yes'
+        env:
+          DUB_BASE_URL: ${{ secrets.DUB_BASE_URL }}
+        run: |
+          # Normal mode only (no turbo). Chunk size controls clean-ness; workers
+          # caps how many dub at once so the engine is never overloaded (the
+          # cause of failed chunks on long videos).
+          CHUNK="${{ github.event.inputs.chunk }}"; [ -z "$CHUNK" ] && CHUNK=60
+          WORKERS="${{ github.event.inputs.workers }}"; [ -z "$WORKERS" ] && WORKERS=8
+          TRIES="${{ github.event.inputs.tries }}"; [ -z "$TRIES" ] && TRIES=5
+          FLAGS=""
+          if [ "$CHUNK" -gt 0 ] 2>/dev/null; then FLAGS="--chunk $CHUNK"; fi
+          if [ "$WORKERS" -gt 0 ] 2>/dev/null; then FLAGS="$FLAGS --workers $WORKERS"; fi
+          if [ "$TRIES" -gt 0 ] 2>/dev/null; then FLAGS="$FLAGS --tries $TRIES"; fi
+          IN=$(ls input/ | head -n1)
+          echo "Dubbing: input/$IN  (chunk=${CHUNK}s, workers=${WORKERS}, tries=${TRIES})"
+
+          COMMON="--src ${{ github.event.inputs.src }} --target ${{ github.event.inputs.target }} \
+            --genre ${{ github.event.inputs.genre }} --speakers ${{ github.event.inputs.speakers }} \
+            --dir $GITHUB_WORKSPACE/output $FLAGS"
+
+          # Pass 1: full run from the video file. Creates work_*/chunks with the
+          # finished dub_*.mp4 cached on disk.
+          python dub_video.py "$GITHUB_WORKSPACE/input/$IN" $COMMON || true
+
+          # Retry loop: keep re-running on the chunk folder until ZERO chunks are
+          # missing. Finished chunks are cached and skipped, so each pass only
+          # redoes the failures. We never give up while progress is still possible.
+          WORKDIR=$(ls -d "$GITHUB_WORKSPACE"/work_* 2>/dev/null | head -n1)
+          if [ -n "$WORKDIR" ] && [ -d "$WORKDIR/chunks" ]; then
+            MAX_PASSES=5
+            PASS=0
+            while :; do
+              TOTAL=$(ls "$WORKDIR/chunks"/part_*.mp4 2>/dev/null | wc -l)
+              DONE=$(ls "$WORKDIR/chunks"/dub_*.mp4 2>/dev/null | wc -l)
+              MISSING=$(( TOTAL - DONE ))
+              echo "::notice::Retry check - $DONE/$TOTAL chunks done, $MISSING missing (pass $PASS)."
+              if [ "$MISSING" -le 0 ]; then echo "All chunks complete."; break; fi
+              PASS=$(( PASS + 1 ))
+              if [ "$PASS" -gt "$MAX_PASSES" ]; then
+                echo "::warning::Reached $MAX_PASSES retry passes with $MISSING still missing; rebuilding with what we have."
+                break
+              fi
+              echo "=== Retry pass $PASS: re-dubbing $MISSING missing chunk(s) ==="
+              PREV=$DONE
+              python dub_video.py "$WORKDIR/chunks" $COMMON || true
+              # If a whole pass made zero new progress, wait then continue (the
+              # engine/service may be briefly rate-limited). Don't stop.
+              NOWDONE=$(ls "$WORKDIR/chunks"/dub_*.mp4 2>/dev/null | wc -l)
+              if [ "$NOWDONE" -le "$PREV" ]; then
+                echo "No new chunks this pass; cooling down 30s before retrying..."
+                sleep 30
+              fi
+            done
+            # Final rebuild from the chunk folder to produce the mux (with gaps
+            # where any chunks are still missing after 5 passes).
+            python dub_video.py "$WORKDIR/chunks" $COMMON || true
+
+            # Collect chunks that still failed (part_NNN with no dub_NNN) so they
+            # ship to DubDone next to the video. You re-dub just these next run.
+            STEM="${IN%.*}"
+            FAILDIR="$GITHUB_WORKSPACE/output/${STEM}_FAILED_CHUNKS"
+            FAILED_LIST=""
+            for p in "$WORKDIR/chunks"/part_*.mp4; do
+              [ -e "$p" ] || continue
+              base=$(basename "$p")           # part_007.mp4
+              num="${base#part_}"; num="${num%.mp4}"   # 007
+              if [ ! -e "$WORKDIR/chunks/dub_${num}.mp4" ]; then
+                mkdir -p "$FAILDIR"
+                cp "$p" "$FAILDIR/$base"
+                FAILED_LIST="$FAILED_LIST $num"
+              fi
+            done
+            if [ -n "$FAILED_LIST" ]; then
+              # A note file so you know which spans are silent and how to fix.
+              {
+                echo "These chunks failed after $TRIES tries and are SILENT in the video."
+                echo "Failed chunk numbers:$FAILED_LIST"
+                echo ""
+                echo "To fix: put this whole *_FAILED_CHUNKS folder back into your"
+                echo "DubInbox as a folder, and run the workflow pointed at it - it"
+                echo "will dub only these and you can splice them in."
+              } > "$FAILDIR/README_FAILED.txt"
+              echo "::warning::Failed chunks saved to ${STEM}_FAILED_CHUNKS:$FAILED_LIST"
+            else
+              echo "No failed chunks - clean dub."
+            fi
+          fi
+
+      - name: Upload result to Drive outbox + archive original
+        if: steps.pull.outputs.found == 'yes' && success()
+        env:
+          INBOX: ${{ github.event.inputs.inbox }}
+          OUTBOX: ${{ github.event.inputs.outbox }}
+        run: |
+          NAME=$(cat .picked_name)
+          echo "Uploading dubbed result to gdrive:${OUTBOX} ..."
+          rclone copy output/ "gdrive:${OUTBOX}" --transfers 1 --drive-chunk-size 64M -v
+          echo "Archiving original '$NAME' to gdrive:${INBOX}/archive ..."
+          rclone moveto "gdrive:${INBOX}/$NAME" "gdrive:${INBOX}/archive/$NAME" -v || \
+            echo "::warning::Could not archive original (it may have been moved already)."
+          echo "Done. Dubbed file is in your Drive '${OUTBOX}' folder."
+
+      - name: Backup copy in Artifacts (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dubbed-video
+          path: output/**
+          retention-days: 30
+          if-no-files-found: warn

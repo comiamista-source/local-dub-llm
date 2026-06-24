@@ -43,11 +43,11 @@ on:
         required: false
       inbox:
         description: "Drive inbox folder name"
-        default: "DubInbox2"
+        default: "Dubz/DubInbox2"
         required: true
       outbox:
         description: "Drive output folder name"
-        default: "DubDone"
+        default: "Dubz/DubDone"
         required: true
 
 jobs:

@@ -86,7 +86,7 @@ jobs:
       - name: Pull newest video from Drive inbox
         id: pull
         env:
-          INBOX: ${{ github.event.inputs.inbox }}
+          INBOX: ${{ github.event.inputs.inbox || 'Dubz/DubInbox2' }}
         run: |
           mkdir -p input output
           REMOTE="gdrive:${INBOX}"
@@ -94,7 +94,17 @@ jobs:
           # List files, pick the newest video via helper script (parse-safe).
           NEWEST=$(rclone lsjson "$REMOTE" --files-only 2>/dev/null | python3 pick_newest.py)
           if [ -z "$NEWEST" ]; then
-            echo "::warning::No video found in $REMOTE. Drop a file there and run again."
+            echo "::warning::No video found in $REMOTE."
+            echo "----- Contents of $REMOTE -----"
+            rclone lsf "$REMOTE" 2>/dev/null || echo "(folder missing or empty)"
+            echo "----- Looking in likely sibling folders -----"
+            for ALT in "Dubz/DubInbox2" "Dubz/DubInbox" "DubInbox2" "DubInbox" "Dubz"; do
+              N=$(rclone lsf "gdrive:$ALT" --files-only 2>/dev/null | grep -iE "\.(mp4|mkv|mov|webm|avi|m4v|ts)$" | head -n5)
+              if [ -n "$N" ]; then
+                echo "  >> videos found in gdrive:$ALT :"; echo "$N" | sed "s/^/       /"
+              fi
+            done
+            echo "Tip: drop your file in $REMOTE, or set the inbox field to the folder shown above."
             echo "found=no" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -201,7 +211,7 @@ jobs:
       - name: Upload result to Drive outbox + archive original
         if: steps.pull.outputs.found == 'yes' && success()
         env:
-          INBOX: ${{ github.event.inputs.inbox }}
+          INBOX: ${{ github.event.inputs.inbox || 'Dubz/DubInbox2' }}
           OUTBOX: ${{ github.event.inputs.outbox }}
         run: |
           NAME=$(cat .picked_name)
